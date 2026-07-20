@@ -74,9 +74,12 @@ SSIMULACRA2: 58.309
 
 ### Options
 
-| Flag         | Metric |
-| ------------ | ------ |
+| Flag         | Description |
+| ------------ | ----------- |
 | `--all`      | Enable every metric |
+| `--format NAME` | FFmpeg pixel format to use when an input cannot be decoded as ordinary media |
+| `--width N`  | Width of a raw input; may be omitted when inherited from a decoded peer |
+| `--height N` | Height of a raw input; may be omitted when inherited from a decoded peer |
 | `--psnr`     | Peak Signal-to-Noise Ratio, full frame (YUV 4:2:0 weighted 4:1:1) |
 | `--psnr-y`   | Peak Signal-to-Noise Ratio, Y plane only |
 | `--ssim`     | Structural Similarity Index (Y channel) |
@@ -96,16 +99,35 @@ libvmaf caps PSNR at 60 dB when planes are identical.
 
 No flags defaults to `--psnr` only.
 
-### Raw YUV inputs
+### Raw inputs
 
-Files with a `.yuv` extension are read as planar I420 8-bit (no header). Pass `--width` and `--height`, or pair with an image of known dimensions:
+For each input, eyeq first asks FFmpeg to decode it as ordinary image or video media. If that fails, the input is retried as headerless raw video. Detection does not depend on the filename extension, so names such as `.yuv`, `.rgb`, `.y8`, `.nv12`, `.yuy2`, `.raw`, and `.bin` all work.
+
+Use `--format` with an FFmpeg pixel-format name. Names are passed through strictly: use `yuv420p`, not `i420`. Supported formats include `nv12`, `gray12le`, `p010le`, and planar 4:2:0, 4:2:2, and 4:4:4 at 10, 12, and 16 bits, as well as other software formats accepted by FFmpeg and libswscale.
+
+Two raw inputs require dimensions:
 
 ```bash
-./build/eyeq --all --width 2048 --height 858 ref.yuv distorted.yuv
-./build/eyeq ref.png distorted.yuv          # dimensions inherited from ref.png
+./build/eyeq --all --format nv12 --width 1920 --height 1080 ref.nv12 distorted.raw
+./build/eyeq --format yuv444p12le --width 2048 --height 1080 ref.rgb distorted.bin
 ```
 
-Raw YUV has no metadata, so it's assumed to already be in the same space as everything else — BT.709, full range. If your `.yuv` uses a different matrix or range, pre-convert it (`ffmpeg -vf "scale=in_color_matrix=bt601:in_range=tv:out_color_matrix=bt709:out_range=full" -pix_fmt yuv420p -f rawvideo`).
+When only one input needs raw fallback, its dimensions are inherited from the decoded peer unless explicitly supplied:
+
+```bash
+./build/eyeq --format yuv444p12le ref.rgb distorted.jpg
+./build/eyeq --format gray12le ref.y8 distorted.png
+```
+
+Without `--format`, raw fallback defaults to `yuv420p`.
+
+Raw inputs carry no color metadata. They are currently interpreted as BT.709, full range, and converted to the existing 8-bit I420/RGB24 metric pipeline. Pre-convert raw inputs that use another matrix or range; for example, to normalize limited-range BT.709 while retaining 10-bit samples:
+
+```bash
+ffmpeg -f rawvideo -pixel_format yuv420p10le -video_size 2048x1080 -i input.yuv \
+  -vf "scale=in_color_matrix=bt709:in_range=tv:out_color_matrix=bt709:out_range=full" \
+  -pix_fmt yuv420p10le -f rawvideo output.yuv
+```
 
 ### Examples
 
