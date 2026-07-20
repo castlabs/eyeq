@@ -10,13 +10,6 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
-bool is_raw_yuv_path(std::string_view path) {
-    if (path.size() < 4)
-        return false;
-    auto ext = path.substr(path.size() - 4);
-    return (ext[0] == '.') && (ext[1] == 'y' || ext[1] == 'Y') && (ext[2] == 'u' || ext[2] == 'U') && (ext[3] == 'v' || ext[3] == 'V');
-}
-
 namespace {
 
 std::optional<Rgb24> from_image_i420(const Image& img) {
@@ -128,7 +121,7 @@ std::optional<Rgb24> from_path(const std::string& path) {
 std::optional<Rgb24> load_rgb24(const Image& img) {
     if (img.rgb24)
         return *img.rgb24;
-    if (is_raw_yuv_path(img.path))
+    if (!img.data.empty())
         return from_image_i420(img);
     return from_path(img.path);
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstring>
 #include <optional>
 #include <utility>
@@ -92,11 +93,21 @@ struct VmafSession {
     }
 
     void copy_plane_data(const Image& ref, const Image& dist) {
+        copy_image_data(ref, ref_pic);
+        copy_image_data(dist, dist_pic);
+    }
+
+    static void copy_image_data(const Image& src, VmafPicture& dst) {
         for (int i = 0; i < 3; ++i) {
-            const auto r = ref.plane(i);
-            const auto d = dist.plane(i);
-            std::memcpy(ref_pic.data[i], r.data(), r.size());
-            std::memcpy(dist_pic.data[i], d.data(), d.size());
+            const int rows = std::min(src.plane_height(i), static_cast<int>(dst.h[i]));
+            const size_t row_bytes = std::min(static_cast<size_t>(src.plane_width(i)), static_cast<size_t>(dst.w[i]));
+            const uint8_t* src_row = src.data.data() + src.plane_offset(i);
+            uint8_t* dst_row = static_cast<uint8_t*>(dst.data[i]);
+            for (int row = 0; row < rows; ++row) {
+                std::memcpy(dst_row, src_row, row_bytes);
+                src_row += src.plane_stride(i);
+                dst_row += dst.stride[i];
+            }
         }
     }
 

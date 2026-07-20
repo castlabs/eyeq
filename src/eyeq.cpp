@@ -1,9 +1,9 @@
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -26,11 +26,56 @@ extern "C" {
 #include "metrics.h"
 #include "rgb24.h"
 
+struct RawInputSpec {
+    AVPixelFormat pixel_format = AV_PIX_FMT_NONE;
+    int width = 0;
+    int height = 0;
+};
+
 // image loading via ffmpeg (ONLY for loading + colorspace conversion)
-static std::optional<Image> load_image(const char* path, ColorSpace cs, bool keep_rgb = false) {
+static std::optional<Image> load_image(const char* path, ColorSpace cs, bool keep_rgb = false, const RawInputSpec* raw = nullptr, bool quiet = false) {
+    const int previous_log_level = av_log_get_level();
+    if (quiet)
+        av_log_set_level(AV_LOG_QUIET);
+    struct LogGuard {
+        ~LogGuard() {
+            if (restore_)
+                av_log_set_level(level_);
+        }
+        int level_;
+        bool restore_;
+    } log_guard{previous_log_level, quiet};
+
     AVFormatContext* fmt = nullptr;
-    if (avformat_open_input(&fmt, path, nullptr, nullptr) < 0) {
-        std::cerr << "Cannot open: " << path << '\n';
+    const AVInputFormat* input_format = nullptr;
+    AVDictionary* input_options = nullptr;
+    struct DictGuard {
+        ~DictGuard() { av_dict_free(&dict_); }
+        AVDictionary*& dict_;
+    } dict_guard{input_options};
+
+    if (raw) {
+        input_format = av_find_input_format("rawvideo");
+        if (!input_format) {
+            if (!quiet)
+                std::cerr << "FFmpeg rawvideo demuxer is unavailable\n";
+            return std::nullopt;
+        }
+
+        const char* pixel_format = av_get_pix_fmt_name(raw->pixel_format);
+        if (!pixel_format) {
+            if (!quiet)
+                std::cerr << "Invalid raw pixel format\n";
+            return std::nullopt;
+        }
+        const std::string video_size = std::to_string(raw->width) + "x" + std::to_string(raw->height);
+        av_dict_set(&input_options, "pixel_format", pixel_format, 0);
+        av_dict_set(&input_options, "video_size", video_size.c_str(), 0);
+    }
+
+    if (avformat_open_input(&fmt, path, input_format, &input_options) < 0) {
+        if (!quiet)
+            std::cerr << "Cannot open: " << path << '\n';
         return std::nullopt;
     }
 
@@ -40,19 +85,22 @@ static std::optional<Image> load_image(const char* path, ColorSpace cs, bool kee
     } fmt_guard{fmt};
 
     if (avformat_find_stream_info(fmt, nullptr) < 0) {
-        std::cerr << "No stream info: " << path << '\n';
+        if (!quiet)
+            std::cerr << "No stream info: " << path << '\n';
         return std::nullopt;
     }
 
     const int vi = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if (vi < 0) {
-        std::cerr << "No video stream: " << path << '\n';
+        if (!quiet)
+            std::cerr << "No video stream: " << path << '\n';
         return std::nullopt;
     }
 
     const AVCodec* codec = avcodec_find_decoder(fmt->streams[vi]->codecpar->codec_id);
     if (!codec) {
-        std::cerr << "No decoder: " << path << '\n';
+        if (!quiet)
+            std::cerr << "No decoder: " << path << '\n';
         return std::nullopt;
     }
 
@@ -60,7 +108,8 @@ static std::optional<Image> load_image(const char* path, ColorSpace cs, bool kee
     avcodec_parameters_to_context(cc, fmt->streams[vi]->codecpar);
     if (avcodec_open2(cc, codec, nullptr) < 0) {
         avcodec_free_context(&cc);
-        std::cerr << "Cannot open codec: " << path << '\n';
+        if (!quiet)
+            std::cerr << "Cannot open codec: " << path << '\n';
         return std::nullopt;
     }
 
@@ -92,7 +141,12 @@ static std::optional<Image> load_image(const char* path, ColorSpace cs, bool kee
     }
 
     if (!got_frame) {
-        std::cerr << "Cannot decode frame: " << path << '\n';
+        if (!quiet) {
+            if (raw)
+                std::cerr << "Cannot decode a complete raw frame: " << path << '\n';
+            else
+                std::cerr << "Cannot decode frame: " << path << '\n';
+        }
         return std::nullopt;
     }
 
@@ -105,7 +159,8 @@ static std::optional<Image> load_image(const char* path, ColorSpace cs, bool kee
     SwsContext* sws = sws_getContext(frame->width, frame->height, src_fmt, frame->width, frame->height, target_fmt, SWS_BICUBIC | SWS_ACCURATE_RND, nullptr,
                                      nullptr, nullptr);
     if (!sws) {
-        std::cerr << "sws_getContext failed: " << path << '\n';
+        if (!quiet)
+            std::cerr << "sws_getContext failed: " << path << '\n';
         return std::nullopt;
     }
 
@@ -113,8 +168,8 @@ static std::optional<Image> load_image(const char* path, ColorSpace cs, bool kee
     const bool src_is_rgb = src_desc && (src_desc->flags & AV_PIX_FMT_FLAG_RGB);
     const bool src_is_jpeg_yuv = src_fmt == AV_PIX_FMT_YUVJ420P || src_fmt == AV_PIX_FMT_YUVJ422P || src_fmt == AV_PIX_FMT_YUVJ444P ||
                                  src_fmt == AV_PIX_FMT_YUVJ411P || src_fmt == AV_PIX_FMT_YUVJ440P;
-    const bool src_full_range = src_is_rgb || src_is_jpeg_yuv || frame->color_range == AVCOL_RANGE_JPEG;
-    const int src_matrix = (frame->colorspace == AVCOL_SPC_BT709) ? SWS_CS_ITU709 : SWS_CS_ITU601;
+    const bool src_full_range = raw || src_is_rgb || src_is_jpeg_yuv || frame->color_range == AVCOL_RANGE_JPEG;
+    const int src_matrix = raw || frame->colorspace == AVCOL_SPC_BT709 ? SWS_CS_ITU709 : SWS_CS_ITU601;
 
     sws_setColorspaceDetails(sws, sws_getCoefficients(src_matrix), src_full_range ? 1 : 0, sws_getCoefficients(SWS_CS_ITU709), 1 /* full range */, 0, 1 << 16,
                              1 << 16);
@@ -170,7 +225,8 @@ static std::optional<Image> load_image(const char* path, ColorSpace cs, bool kee
         SwsContext* rgb_sws = sws_getContext(frame->width, frame->height, src_fmt, frame->width, frame->height, AV_PIX_FMT_RGB24,
                                              SWS_BICUBIC | SWS_ACCURATE_RND, nullptr, nullptr, nullptr);
         if (!rgb_sws) {
-            std::cerr << "sws_getContext failed for RGB: " << path << '\n';
+            if (!quiet)
+                std::cerr << "sws_getContext failed for RGB: " << path << '\n';
             return std::nullopt;
         }
 
@@ -180,62 +236,14 @@ static std::optional<Image> load_image(const char* path, ColorSpace cs, bool kee
         rgb->pixels.resize(static_cast<size_t>(frame->width) * frame->height * 3);
         uint8_t* rgb_dst[4] = {rgb->pixels.data(), nullptr, nullptr, nullptr};
         int rgb_dst_stride[4] = {frame->width * 3, 0, 0, 0};
+        if (raw)
+            sws_setColorspaceDetails(rgb_sws, sws_getCoefficients(SWS_CS_ITU709), 1 /* full range */, sws_getCoefficients(SWS_CS_ITU709), 1, 0, 1 << 16,
+                                     1 << 16);
         sws_scale(rgb_sws, (const uint8_t* const*)frame->data, frame->linesize, 0, frame->height, rgb_dst, rgb_dst_stride);
         sws_freeContext(rgb_sws);
         img.rgb24 = std::move(rgb);
     }
 
-    return img;
-}
-
-static std::optional<Image> load_rgb_only_image(const char* path) {
-    Image img;
-    img.path = path;
-    auto rgb = load_rgb24(img);
-    if (!rgb) {
-        std::cerr << "Cannot decode RGB: " << path << '\n';
-        return std::nullopt;
-    }
-    img.width = rgb->width;
-    img.height = rgb->height;
-    img.rgb24 = std::make_shared<Rgb24>(std::move(*rgb));
-    return img;
-}
-
-// Raw planar I420 8-bit: w*h Y, then (w/2)*(h/2) U, then (w/2)*(h/2) V.
-// We treat the bytes as already in our normalized space (BT.709 full-range);
-// no metadata is available to do otherwise.
-static std::optional<Image> load_raw_yuv(const char* path, int w, int h) {
-    if (w <= 0 || h <= 0) {
-        std::cerr << "raw YUV needs --width and --height (or a peer image with known dimensions): " << path << '\n';
-        return std::nullopt;
-    }
-    if ((w & 1) || (h & 1)) {
-        std::cerr << "raw YUV 4:2:0 requires even width and height: " << path << '\n';
-        return std::nullopt;
-    }
-
-    const size_t y_size = static_cast<size_t>(w) * h;
-    const size_t c_size = static_cast<size_t>(w / 2) * (h / 2);
-    const size_t total = y_size + 2 * c_size;
-
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        std::cerr << "Cannot open: " << path << '\n';
-        return std::nullopt;
-    }
-
-    Image img;
-    img.width = w;
-    img.height = h;
-    img.colorspace = ColorSpace::I420;
-    img.path = path;
-    img.data.resize(total);
-    f.read(reinterpret_cast<char*>(img.data.data()), static_cast<std::streamsize>(total));
-    if (static_cast<size_t>(f.gcount()) != total) {
-        std::cerr << "Short read for raw YUV (expected " << total << " bytes, got " << f.gcount() << "): " << path << '\n';
-        return std::nullopt;
-    }
     return img;
 }
 
@@ -245,6 +253,7 @@ struct Options {
     std::string_view dist_path;
     int width = 0;
     int height = 0;
+    AVPixelFormat raw_format = AV_PIX_FMT_NONE;
 };
 
 static constexpr std::string_view kAllMetrics[] = {"psnr", "psnr-y", "ssim", "ms-ssim", "psnr-hvs", "xpsnr", "xpsnr-y",
@@ -252,10 +261,6 @@ static constexpr std::string_view kAllMetrics[] = {"psnr", "psnr-y", "ssim", "ms
 
 static bool metric_uses_rgb(std::string_view metric) {
     return metric == "fsim" || metric == "fsimc" || metric == "mdsi" || metric == "dssim" || metric == "ssimulacra2";
-}
-
-static bool metric_uses_i420(std::string_view metric) {
-    return !metric_uses_rgb(metric);
 }
 
 static void add_metric(Options& opts, std::string_view metric) {
@@ -269,6 +274,7 @@ static void print_help(std::ostream& os) {
           "Options:\n"
           "  -h, --help     Show this message and exit\n"
           "  --all          Enable every metric (default: --psnr)\n"
+          "  --format NAME  Set the FFmpeg pixel format used when normal decoding fails\n"
           "\n"
           "Metrics (range; direction):\n"
           "  --psnr         PSNR, full frame (YUV 4:2:0 weighted 4:1:1)         [dB; higher = better, capped at 60 when identical]\n"
@@ -287,12 +293,27 @@ static void print_help(std::ostream& os) {
           "  --ssimulacra2  SSIMULACRA 2.1 perceptual quality                   [-inf..100; higher = better, 100 = identical]\n"
           "  --ssim2        Alias for --ssimulacra2\n"
           "\n"
-          "Raw YUV inputs (.yuv, planar I420 8-bit):\n"
-          "  --width N      Width in pixels  (omit when paired with an image of known dimensions)\n"
-          "  --height N     Height in pixels (omit when paired with an image of known dimensions)\n"
+          "Raw inputs:\n"
+          "  --width N      Width in pixels\n"
+          "  --height N     Height in pixels\n"
+          "  --format uses FFmpeg pixel-format names (for example yuv420p, nv12, gray12le).\n"
+          "  Each input is decoded normally first, then retried as raw if FFmpeg cannot decode it.\n"
+          "  Raw dimensions come from --width/--height or a decoded peer. Without --format, raw fallback uses yuv420p.\n"
           "\n"
           "No flags defaults to --psnr only. Inputs are converted to YUV 4:2:0, BT.709, full range.\n"
           "Raw YUV is assumed already in that space (no metadata to do otherwise).\n";
+}
+
+static bool parse_dimension(const char* option, const char* value, int& out) {
+    const std::string_view text(value);
+    int parsed = 0;
+    const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), parsed);
+    if (ec != std::errc{} || ptr != text.data() + text.size() || parsed <= 0) {
+        std::cerr << option << " requires a positive integer\n";
+        return false;
+    }
+    out = parsed;
+    return true;
 }
 
 static bool parse_args(Options& opts, int argc, char* argv[]) {
@@ -341,13 +362,31 @@ static bool parse_args(Options& opts, int argc, char* argv[]) {
                 std::cerr << "--width requires a value\n";
                 return false;
             }
-            opts.width = std::atoi(argv[++i]);
+            if (!parse_dimension("--width", argv[++i], opts.width))
+                return false;
         } else if (arg == "--height") {
             if (i + 1 >= argc) {
                 std::cerr << "--height requires a value\n";
                 return false;
             }
-            opts.height = std::atoi(argv[++i]);
+            if (!parse_dimension("--height", argv[++i], opts.height))
+                return false;
+        } else if (arg == "--format") {
+            if (i + 1 >= argc) {
+                std::cerr << "--format requires a value\n";
+                return false;
+            }
+            const char* format_name = argv[++i];
+            const AVPixelFormat pixel_format = av_get_pix_fmt(format_name);
+            if (pixel_format == AV_PIX_FMT_NONE) {
+                std::cerr << "Unknown FFmpeg pixel format: " << format_name << '\n';
+                return false;
+            }
+            if (!sws_isSupportedInput(pixel_format)) {
+                std::cerr << "FFmpeg pixel format is not supported as a conversion input: " << format_name << '\n';
+                return false;
+            }
+            opts.raw_format = pixel_format;
         } else if (arg == "--all") {
             for (const auto metric: kAllMetrics)
                 add_metric(opts, metric);
@@ -382,40 +421,35 @@ int main(int argc, char* argv[]) {
 
     const std::string ref_path(opts.ref_path);
     const std::string dist_path(opts.dist_path);
-    const bool ref_yuv = is_raw_yuv_path(opts.ref_path);
-    const bool dist_yuv = is_raw_yuv_path(opts.dist_path);
     const bool any_rgb_metric = std::any_of(opts.metrics.begin(), opts.metrics.end(), metric_uses_rgb);
-    const bool any_i420_metric = std::any_of(opts.metrics.begin(), opts.metrics.end(), metric_uses_i420);
-    const bool rgb_only_file_inputs = any_rgb_metric && !any_i420_metric && !ref_yuv && !dist_yuv;
 
-    std::optional<Image> ref, dist;
-    if (ref_yuv && dist_yuv) {
-        if (opts.width <= 0 || opts.height <= 0) {
-            std::cerr << "Both inputs are raw YUV; --width and --height are required\n";
-            return 1;
-        }
-        ref = load_raw_yuv(ref_path.c_str(), opts.width, opts.height);
-        dist = load_raw_yuv(dist_path.c_str(), opts.width, opts.height);
-    } else if (ref_yuv) {
-        dist = load_image(dist_path.c_str(), cs, any_rgb_metric);
-        if (!dist)
-            return 1;
-        const int w = opts.width > 0 ? opts.width : dist->width;
-        const int h = opts.height > 0 ? opts.height : dist->height;
-        ref = load_raw_yuv(ref_path.c_str(), w, h);
-    } else if (dist_yuv) {
-        ref = load_image(ref_path.c_str(), cs, any_rgb_metric);
+    const AVPixelFormat raw_format = opts.raw_format != AV_PIX_FMT_NONE ? opts.raw_format : AV_PIX_FMT_YUV420P;
+    auto load_raw = [&](const std::string& path, int width, int height) {
+        const RawInputSpec spec{raw_format, width, height};
+        return load_image(path.c_str(), cs, any_rgb_metric, &spec);
+    };
+
+    // Try ordinary media decoding first, regardless of filename. An input that
+    // FFmpeg cannot decode is retried as headerless raw video.
+    std::optional<Image> ref = load_image(ref_path.c_str(), cs, any_rgb_metric, nullptr, true);
+    std::optional<Image> dist = load_image(dist_path.c_str(), cs, any_rgb_metric, nullptr, true);
+
+    if (!ref && !dist && (opts.width <= 0 || opts.height <= 0)) {
+        std::cerr << "Both inputs require raw fallback; --width and --height are required\n";
+        return 1;
+    }
+
+    if (!ref) {
+        const int width = opts.width > 0 ? opts.width : dist->width;
+        const int height = opts.height > 0 ? opts.height : dist->height;
+        ref = load_raw(ref_path, width, height);
         if (!ref)
             return 1;
-        const int w = opts.width > 0 ? opts.width : ref->width;
-        const int h = opts.height > 0 ? opts.height : ref->height;
-        dist = load_raw_yuv(dist_path.c_str(), w, h);
-    } else if (rgb_only_file_inputs) {
-        ref = load_rgb_only_image(ref_path.c_str());
-        dist = load_rgb_only_image(dist_path.c_str());
-    } else {
-        ref = load_image(ref_path.c_str(), cs, any_rgb_metric);
-        dist = load_image(dist_path.c_str(), cs, any_rgb_metric);
+    }
+    if (!dist) {
+        const int width = opts.width > 0 ? opts.width : ref->width;
+        const int height = opts.height > 0 ? opts.height : ref->height;
+        dist = load_raw(dist_path, width, height);
     }
 
     if (!ref || !dist)
