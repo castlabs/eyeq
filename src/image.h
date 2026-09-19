@@ -42,6 +42,9 @@ struct Image {
     std::vector<uint8_t> data;
     std::string path;
     std::shared_ptr<Rgb24> rgb24;
+    // Native 16-bit RGB, interleaved in R/G/B order. When populated, data is empty
+    // and only the RGB PSNR path may consume this image.
+    std::vector<uint16_t> rgb16;
 
     std::span<const uint8_t> plane(int idx) const {
         int w = width, h = height;

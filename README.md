@@ -76,11 +76,14 @@ SSIMULACRA2: 58.309
 
 | Flag         | Description |
 | ------------ | ----------- |
-| `--all`      | Enable every metric |
+| `--all`      | Enable every supported metric for the input type |
 | `--format NAME` | FFmpeg pixel format to use when an input cannot be decoded as ordinary media |
 | `--width N`  | Width of a raw input; may be omitted when inherited from a decoded peer |
 | `--height N` | Height of a raw input; may be omitted when inherited from a decoded peer |
-| `--psnr`     | Peak Signal-to-Noise Ratio, full frame (YUV 4:2:0 weighted 4:1:1) |
+| `--logc4`    | Decode both RGB16 inputs from LogC4 to linear light before measuring PSNR |
+| `--psnr-peak N` | RGB16 PSNR peak in linear units (default: 1.0) |
+| `--psnr`     | Peak Signal-to-Noise Ratio, full frame (equal RGB weights for RGB16; YUV 4:2:0 weighted 4:1:1 otherwise) |
+| `--psnr-r`, `--psnr-g`, `--psnr-b` | PSNR for an individual RGB16 channel |
 | `--psnr-y`   | Peak Signal-to-Noise Ratio, Y plane only |
 | `--ssim`     | Structural Similarity Index (Y channel) |
 | `--ms-ssim`  | Multi-Scale SSIM (Y channel) |
@@ -95,9 +98,33 @@ SSIMULACRA2: 58.309
 | `--dssim`    | Multi-scale L\*a\*b\* structural dissimilarity (clean-room reimplementation of Lesinski's DSSIM; lower = better, 0 = identical) |
 | `--ssimulacra2`, `--ssim2` | SSIMULACRA 2.1 perceptual quality (native port of the Cloudinary/JPEG XL metric math with a Highway-accelerated blur path; no libjxl/lcms/PNG temp-file path) |
 
-libvmaf caps PSNR at 60 dB when planes are identical.
+For the 8-bit YUV pipeline, libvmaf caps PSNR at 60 dB when planes are identical. RGB16 PSNR is uncapped and reports `inf (identical)` for zero error.
 
-No flags defaults to `--psnr` only.
+No metric flags defaults to all four PSNR scores for RGB16, or `--psnr` only for other inputs. `--all` selects all supported metrics for the input type.
+
+### 16-bit RGB and LogC4
+
+16-bit-per-channel RGB TIFFs are detected automatically; for raw inputs, specify `--format rgb48le`. Both retain every sample bit. This path supports combined PSNR and PSNR (R), PSNR (G), and PSNR (B). Both inputs must have 16-bit RGB channels, matching dimensions, and the same gamut and encoding. There is no YUV conversion, chroma subsampling, or gamut transform. Alpha, if present, is ignored. Other metrics are rejected for RGB16.
+
+For linear RGB16, samples are normalized from 0–65535 to 0–1:
+
+```bash
+./build/eyeq reference.tif distorted.tif
+./build/eyeq --format rgb48le --width 2048 --height 858 reference.rgb distorted.rgb
+```
+
+For LogC4, add `--logc4` to decode **both** inputs into relative scene-linear RGB using [ARRI's LogC4 specification, section 4.1.2](https://www.arri.com/resource/blob/278790/f3318e8c9c65617d8c5ca3f8b3e32051/2023-05-arri-logc4-specification-data.pdf). The flag is explicit: encoding is not inferred from filenames or TIFF metadata.
+
+```bash
+./build/eyeq --logc4 reference.tif distorted.tif
+./build/eyeq --logc4 --format rgb48le --width 2048 --height 858 reference.rgb distorted.rgb
+# A TIFF supplies the dimensions for its raw peer:
+./build/eyeq --logc4 --format rgb48le reference.tif distorted.rgb
+```
+
+LogC4 decoding preserves negative linear values and highlights above 1.0. PSNR uses `10 * log10(peak² / MSE)`, with **peak = 1.0 in linear units** by default for both encodings. Values outside that range are not clipped, so LogC4 comparisons can have negative PSNR. Use `--psnr-peak N` to choose a different fixed normalization (for example, `469.8` for the approximate linear value represented by LogC4 code 1.0); the peak is never estimated from image content.
+
+Combined MSE is `(MSE_R + MSE_G + MSE_B) / 3`, not an average of channel dB scores. Use `--psnr` for only the combined score, or select individual channels with `--psnr-r`, `--psnr-g`, and `--psnr-b`.
 
 ### Raw inputs
 
@@ -121,7 +148,7 @@ When only one input needs raw fallback, its dimensions are inherited from the de
 
 Without `--format`, raw fallback defaults to `yuv420p`.
 
-Raw inputs carry no color metadata. They are currently interpreted as BT.709, full range, and converted to the existing 8-bit I420/RGB24 metric pipeline. Pre-convert raw inputs that use another matrix or range; for example, to normalize limited-range BT.709 while retaining 10-bit samples:
+Raw inputs carry no color metadata. RGB16 uses the native path described above. Other raw inputs are interpreted as BT.709, full range, and converted to the existing 8-bit I420/RGB24 metric pipeline. Pre-convert raw inputs that use another matrix or range; for example, to normalize limited-range BT.709 while retaining 10-bit samples:
 
 ```bash
 ffmpeg -f rawvideo -pixel_format yuv420p10le -video_size 2048x1080 -i input.yuv \
@@ -141,4 +168,12 @@ All metrics:
 
 ```bash
 ./build/eyeq --all ref.jpg distorted.jpg
+```
+
+### RGB16 regression tests
+
+With Python 3 and FFmpeg available, run the numerical and input-format checks against a built binary:
+
+```bash
+python3 tests/test_rgb16.py ./build/eyeq
 ```

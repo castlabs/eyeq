@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <span>
@@ -18,12 +19,14 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/intreadwrite.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 }
 
 #include "image.h"
 #include "metrics.h"
+#include "psnr_rgb16.h"
 #include "rgb24.h"
 
 struct RawInputSpec {
@@ -152,6 +155,32 @@ static std::optional<Image> load_image(const char* path, ColorSpace cs, bool kee
 
     const AVPixelFormat target_fmt = color_space_to_av_pix_fmt(cs);
     const AVPixelFormat src_fmt = static_cast<AVPixelFormat>(frame->format);
+    const AVPixFmtDescriptor* src_desc = av_pix_fmt_desc_get(src_fmt);
+
+    // Extract native RGB16 samples before any YUV conversion, resampling, or
+    // quantization. Component descriptors cover packed/planar RGB and endianness.
+    const bool src_is_rgb16 = src_desc && (src_desc->flags & AV_PIX_FMT_FLAG_RGB) && !(src_desc->flags & AV_PIX_FMT_FLAG_FLOAT) &&
+                              src_desc->nb_components >= 3 && src_desc->comp[0].depth == 16 && src_desc->comp[1].depth == 16 &&
+                              src_desc->comp[2].depth == 16;
+    if (src_is_rgb16) {
+        Image img;
+        img.width = frame->width;
+        img.height = frame->height;
+        img.path = path;
+        img.rgb16.resize(static_cast<size_t>(img.width) * img.height * 3);
+        for (int y = 0; y < img.height; ++y) {
+            for (int c = 0; c < 3; ++c) {
+                const auto& component = src_desc->comp[c];
+                const uint8_t* row = frame->data[component.plane] + static_cast<ptrdiff_t>(y) * frame->linesize[component.plane];
+                for (int x = 0; x < img.width; ++x) {
+                    const uint8_t* sample = row + static_cast<ptrdiff_t>(x) * component.step + component.offset;
+                    img.rgb16[(static_cast<size_t>(y) * img.width + x) * 3 + c] =
+                            src_desc->flags & AV_PIX_FMT_FLAG_BE ? AV_RB16(sample) : AV_RL16(sample);
+                }
+            }
+        }
+        return img;
+    }
 
     // Always go through sws with explicit BT.709 + full-range output, regardless of
     // source format. Mixed sources (e.g., PNG-as-RGB vs JPEG-as-YUVJ) otherwise pick
@@ -164,7 +193,6 @@ static std::optional<Image> load_image(const char* path, ColorSpace cs, bool kee
         return std::nullopt;
     }
 
-    const AVPixFmtDescriptor* src_desc = av_pix_fmt_desc_get(src_fmt);
     const bool src_is_rgb = src_desc && (src_desc->flags & AV_PIX_FMT_FLAG_RGB);
     const bool src_is_jpeg_yuv = src_fmt == AV_PIX_FMT_YUVJ420P || src_fmt == AV_PIX_FMT_YUVJ422P || src_fmt == AV_PIX_FMT_YUVJ444P ||
                                  src_fmt == AV_PIX_FMT_YUVJ411P || src_fmt == AV_PIX_FMT_YUVJ440P;
@@ -254,10 +282,15 @@ struct Options {
     int width = 0;
     int height = 0;
     AVPixelFormat raw_format = AV_PIX_FMT_NONE;
+    bool all = false;
+    bool logc4 = false;
+    std::optional<double> psnr_peak;
 };
 
 static constexpr std::string_view kAllMetrics[] = {"psnr", "psnr-y", "ssim", "ms-ssim", "psnr-hvs", "xpsnr", "xpsnr-y",
                                                    "fsim", "fsimc",  "mdsi", "vmaf",    "vmaf-neg", "dssim", "ssimulacra2"};
+static constexpr std::string_view kRgb16Metrics[] = {"psnr", "psnr-r", "psnr-g", "psnr-b"};
+static constexpr std::string_view kRgb16Labels[] = {"PSNR", "PSNR (R)", "PSNR (G)", "PSNR (B)"};
 
 static bool metric_uses_rgb(std::string_view metric) {
     return metric == "fsim" || metric == "fsimc" || metric == "mdsi" || metric == "dssim" || metric == "ssimulacra2";
@@ -273,12 +306,17 @@ static void print_help(std::ostream& os) {
           "\n"
           "Options:\n"
           "  -h, --help     Show this message and exit\n"
-          "  --all          Enable every metric (default: --psnr)\n"
+          "  --all          Enable every supported metric for the input type\n"
           "  --format NAME  Set the FFmpeg pixel format used when normal decoding fails\n"
+          "  --logc4        Decode both RGB16 inputs from LogC4 to linear light\n"
+          "  --psnr-peak N  RGB16 PSNR peak in linear units (default: 1.0)\n"
           "\n"
           "Metrics (range; direction):\n"
-          "  --psnr         PSNR, full frame (YUV 4:2:0 weighted 4:1:1)         [dB; higher = better, capped at 60 when identical]\n"
+          "  --psnr         PSNR, combined RGB16 or full YUV frame              [dB; higher = better]\n"
           "  --psnr-y       PSNR, Y plane only                                  [dB; higher = better]\n"
+          "  --psnr-r       PSNR, R channel only (RGB16 inputs)                  [dB; higher = better]\n"
+          "  --psnr-g       PSNR, G channel only (RGB16 inputs)                  [dB; higher = better]\n"
+          "  --psnr-b       PSNR, B channel only (RGB16 inputs)                  [dB; higher = better]\n"
           "  --ssim         Structural Similarity Index (Y)                     [0..1; higher = better, 1 = identical]\n"
           "  --ms-ssim      Multi-Scale SSIM (Y)                                [0..1; higher = better, 1 = identical]\n"
           "  --psnr-hvs     PSNR with Human Visual System weighting             [dB; higher = better]\n"
@@ -296,11 +334,17 @@ static void print_help(std::ostream& os) {
           "Raw inputs:\n"
           "  --width N      Width in pixels\n"
           "  --height N     Height in pixels\n"
-          "  --format uses FFmpeg pixel-format names (for example yuv420p, nv12, gray12le).\n"
+          "  --format uses FFmpeg pixel-format names (for example yuv420p, nv12, gray12le, rgb48le).\n"
           "  Each input is decoded normally first, then retried as raw if FFmpeg cannot decode it.\n"
           "  Raw dimensions come from --width/--height or a decoded peer. Without --format, raw fallback uses yuv420p.\n"
           "\n"
-          "No flags defaults to --psnr only. Inputs are converted to YUV 4:2:0, BT.709, full range.\n"
+          "RGB16 inputs retain all 16 bits and default to combined PSNR and PSNR (R/G/B).\n"
+          "  --psnr selects combined RGB PSNR, with equal channel weighting; identical inputs yield inf.\n"
+          "  Samples are normalized by 65535 and assumed linear unless --logc4 is supplied.\n"
+          "  LogC4 decoding preserves negative values and highlights above 1; PSNR can be negative.\n"
+          "  Both inputs must be RGB16 in the same gamut/encoding. Only PSNR metrics are supported.\n"
+          "Other inputs default to --psnr only and are converted to YUV 4:2:0, BT.709, full range.\n"
+          "  YUV PSNR uses 4:1:1 plane weights; libvmaf caps identical planes at 60 dB.\n"
           "Raw YUV is assumed already in that space (no metadata to do otherwise).\n";
 }
 
@@ -333,6 +377,8 @@ static bool parse_args(Options& opts, int argc, char* argv[]) {
             add_metric(opts, "psnr");
         else if (arg == "--psnr-y")
             add_metric(opts, "psnr-y");
+        else if (arg == "--psnr-r" || arg == "--psnr-g" || arg == "--psnr-b")
+            add_metric(opts, arg.substr(2));
         else if (arg == "--ssim")
             add_metric(opts, "ssim");
         else if (arg == "--ms-ssim")
@@ -387,9 +433,23 @@ static bool parse_args(Options& opts, int argc, char* argv[]) {
                 return false;
             }
             opts.raw_format = pixel_format;
+        } else if (arg == "--logc4") {
+            opts.logc4 = true;
+        } else if (arg == "--psnr-peak") {
+            if (i + 1 >= argc) {
+                std::cerr << "--psnr-peak requires a value\n";
+                return false;
+            }
+            const char* value = argv[++i];
+            char* end = nullptr;
+            const double peak = std::strtod(value, &end);
+            if (end == value || *end != '\0' || !std::isfinite(peak) || peak <= 0.0) {
+                std::cerr << "--psnr-peak requires a positive finite number\n";
+                return false;
+            }
+            opts.psnr_peak = peak;
         } else if (arg == "--all") {
-            for (const auto metric: kAllMetrics)
-                add_metric(opts, metric);
+            opts.all = true;
         } else if (arg.starts_with("--")) {
             std::cerr << "Unknown option: " << arg << '\n';
             return false;
@@ -401,9 +461,6 @@ static bool parse_args(Options& opts, int argc, char* argv[]) {
         print_help(std::cerr);
         return false;
     }
-
-    if (opts.metrics.empty())
-        add_metric(opts, "psnr");
 
     opts.ref_path = positional[0];
     opts.dist_path = positional[1];
@@ -421,7 +478,7 @@ int main(int argc, char* argv[]) {
 
     const std::string ref_path(opts.ref_path);
     const std::string dist_path(opts.dist_path);
-    const bool any_rgb_metric = std::any_of(opts.metrics.begin(), opts.metrics.end(), metric_uses_rgb);
+    const bool any_rgb_metric = opts.all || std::any_of(opts.metrics.begin(), opts.metrics.end(), metric_uses_rgb);
 
     const AVPixelFormat raw_format = opts.raw_format != AV_PIX_FMT_NONE ? opts.raw_format : AV_PIX_FMT_YUV420P;
     auto load_raw = [&](const std::string& path, int width, int height) {
@@ -459,6 +516,48 @@ int main(int argc, char* argv[]) {
         std::cerr << "Dimension mismatch: " << ref->width << "x" << ref->height << " vs " << dist->width << "x" << dist->height << '\n';
         return 1;
     }
+
+    if (!ref->rgb16.empty() || !dist->rgb16.empty()) {
+        if (ref->rgb16.empty() || dist->rgb16.empty()) {
+            std::cerr << "RGB16 PSNR requires both inputs to have 16-bit RGB channels\n";
+            return 1;
+        }
+        if (opts.all || opts.metrics.empty())
+            for (const auto metric: kRgb16Metrics)
+                add_metric(opts, metric);
+        for (const auto metric: opts.metrics) {
+            if (std::find(std::begin(kRgb16Metrics), std::end(kRgb16Metrics), metric) == std::end(kRgb16Metrics)) {
+                std::cerr << "Metric --" << metric << " is not supported for RGB16 inputs; use --psnr, --psnr-r, --psnr-g, or --psnr-b\n";
+                return 1;
+            }
+        }
+        const auto scores = psnr_rgb16(ref->rgb16, dist->rgb16, opts.logc4, opts.psnr_peak.value_or(1.0));
+        for (const auto metric: opts.metrics) {
+            const size_t index = std::find(std::begin(kRgb16Metrics), std::end(kRgb16Metrics), metric) - std::begin(kRgb16Metrics);
+            std::cout << kRgb16Labels[index] << ": ";
+            if (std::isinf(scores[index]))
+                std::cout << "inf (identical)\n";
+            else
+                std::cout << scores[index] << '\n';
+        }
+        return 0;
+    }
+
+    if (opts.logc4 || opts.psnr_peak) {
+        std::cerr << "--logc4 and --psnr-peak require 16-bit RGB inputs\n";
+        return 1;
+    }
+    for (const auto metric: opts.metrics) {
+        if (metric == "psnr-r" || metric == "psnr-g" || metric == "psnr-b") {
+            std::cerr << "--" << metric << " requires 16-bit RGB inputs\n";
+            return 1;
+        }
+    }
+    if (opts.all)
+        for (const auto metric: kAllMetrics)
+            add_metric(opts, metric);
+    if (opts.metrics.empty())
+        add_metric(opts, "psnr");
 
     int failed = 0;
     for (const auto& metric_name: opts.metrics) {
